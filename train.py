@@ -53,8 +53,8 @@ from diffusers.utils.import_utils import is_xformers_available
 if is_wandb_available():
     import wandb
 
-    
-    
+
+
 ## SDXL
 import functools
 import gc
@@ -73,7 +73,7 @@ DATASET_NAME_MAPPING = {
     "yuvalkirstain/pickapic_v2": ("jpg_0", "jpg_1", "label_0", "caption"),
 }
 
-        
+
 def import_model_class_from_model_name_or_path(
     pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"
 ):
@@ -338,7 +338,7 @@ def parse_args():
         help="Path to pretrained VAE model with better numerical stability. More details: https://github.com/huggingface/diffusers/pull/4038.",
     )
     parser.add_argument("--sdxl", action='store_true', help="Train sdxl")
-    
+
     ## DPO
     parser.add_argument("--sft", action='store_true', help="Run Supervised Fine-Tuning instead of Direct Preference Optimization")
     parser.add_argument("--beta_dpo", type=float, default=5000, help="The beta DPO temperature controlling strength of KL penalty")
@@ -363,7 +363,7 @@ def parse_args():
     parser.add_argument(
         "--dreamlike_pairs_only", action="store_true", help="Only train on pairs where both generations are from dreamlike"
     )
-    
+
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -381,7 +381,7 @@ def parse_args():
             args.resolution = 1024
         else:
             args.resolution = 512
-            
+
     args.train_method = 'sft' if args.sft else 'dpo'
     return args
 
@@ -431,9 +431,9 @@ def encode_prompt_sdxl(batch, text_encoders, tokenizers, proportion_empty_prompt
 
 
 def main():
-    
+
     args = parse_args()
-    
+
     #### START ACCELERATOR BOILERPLATE ###
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
 
@@ -471,11 +471,11 @@ def main():
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
     ### END ACCELERATOR BOILERPLATE
-    
-    
+
+
     ### START DIFFUSION BOILERPLATE ###
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, 
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path,
                                                     subfolder="scheduler")
     def enforce_zero_terminal_snr(scheduler):
         # Modified from https://arxiv.org/pdf/2305.08891.pdf
@@ -497,13 +497,13 @@ def main():
         alphas_bar = alphas_bar_sqrt ** 2
         alphas = alphas_bar[1:] / alphas_bar[:-1]
         alphas = torch.cat([alphas_bar[0:1], alphas])
-    
+
         alphas_cumprod = torch.cumprod(alphas, dim=0)
         scheduler.alphas_cumprod = alphas_cumprod
-        return 
+        return
     if 'turbo' in args.pretrained_model_name_or_path:
         enforce_zero_terminal_snr(noise_scheduler)
-    
+
     # SDXL has two text encoders
     if args.sdxl:
         # Load the tokenizers
@@ -533,9 +533,9 @@ def main():
 
         return [deepspeed_plugin.zero3_init_context_manager(enable=False)]
 
-    
+
     # BRAM NOTE: We're not using deepspeed currently so not sure it'll work. Could be good to add though!
-    # 
+    #
     # Currently Accelerate doesn't know how to handle multiple models under Deepspeed ZeRO stage 3.
     # For this to work properly all models must be run through `accelerate.prepare`. But accelerate
     # will try to assign the same optimizer with the same weights to all models during
@@ -615,12 +615,12 @@ def main():
 
     # BRAM NOTE: We're using >=0.16.0. Below was a bit of a bug hive. I hacked around it, but ideally ref_unet wouldn't
     # be getting passed here
-    # 
+    #
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
-            
+
             if len(models) > 1:
                 assert args.train_method == 'dpo' # 2nd model is just ref_unet in DPO case
             models_to_save = models[:1]
@@ -681,9 +681,9 @@ def main():
             eps=args.adam_epsilon,
         )
 
-        
-        
-        
+
+
+
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
     if args.dataset_name is not None:
@@ -763,9 +763,9 @@ def main():
         ]
     )
 
-    
+
     ##### START BIG OLD DATASET BLOCK #####
-    
+
     #### START PREPROCESSING/COLLATION ####
     if args.train_method == 'dpo':
         print("Ignoring image_column variable, reading from jpg_0 and jpg_1")
@@ -798,15 +798,15 @@ def main():
                 return_d["caption"] = [example["caption"] for example in examples]
             else:
                 return_d["input_ids"] = torch.stack([example["input_ids"] for example in examples])
-                
+
             if args.choice_model:
                 # If using AIF then deliver image data for choice model to determine if should flip pixel values
                 for k in ['jpg_0', 'jpg_1']:
                     return_d[k] = [Image.open(io.BytesIO( example[k])).convert("RGB")
                                    for example in examples]
-                return_d["caption"] = [example["caption"] for example in examples] 
+                return_d["caption"] = [example["caption"] for example in examples]
             return return_d
-         
+
         if args.choice_model:
             # TODO: Fancy way of doing this?
             if args.choice_model == 'hps':
@@ -850,7 +850,7 @@ def main():
                 return_d["input_ids"] = torch.stack([example["input_ids"] for example in examples])
             return return_d
     #### END PREPROCESSING/COLLATION ####
-    
+
     ### DATASET #####
     with accelerator.main_process_first():
         if 'pickapic' in args.dataset_name:
@@ -861,7 +861,7 @@ def main():
             dataset[args.split] = dataset[args.split].select(not_split_idx)
             new_len = dataset[args.split].num_rows
             print(f"Eliminated {orig_len - new_len}/{orig_len} split decisions for Pick-a-pic")
-            
+
             # Below if if want to train on just the Dreamlike vs dreamlike pairs
             if args.dreamlike_pairs_only:
                 orig_len = dataset[args.split].num_rows
@@ -871,7 +871,7 @@ def main():
                 dataset[args.split] = dataset[args.split].select(dream_like_idx)
                 new_len = dataset[args.split].num_rows
                 print(f"Eliminated {orig_len - new_len}/{orig_len} non-dreamlike gens for Pick-a-pic")
-                
+
         if args.max_train_samples is not None:
             dataset[args.split] = dataset[args.split].shuffle(seed=args.seed).select(range(args.max_train_samples))
         # Set the training transforms
@@ -887,7 +887,7 @@ def main():
         drop_last=True
     )
     ##### END BIG OLD DATASET BLOCK #####
-    
+
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -902,7 +902,7 @@ def main():
         num_training_steps=args.max_train_steps * accelerator.num_processes,
     )
 
-    
+
     #### START ACCELERATOR PREP ####
     unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         unet, optimizer, train_dataloader, lr_scheduler
@@ -918,7 +918,7 @@ def main():
         weight_dtype = torch.bfloat16
         args.mixed_precision = accelerator.mixed_precision
 
-        
+
     # Move text_encode and vae to gpu and cast to weight_dtype
     vae.to(accelerator.device, dtype=weight_dtype)
     if args.sdxl:
@@ -938,8 +938,8 @@ def main():
         if args.train_method == 'dpo':
             ref_unet.to(accelerator.device, dtype=weight_dtype)
     ### END ACCELERATOR PREP ###
-    
-    
+
+
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
@@ -991,13 +991,13 @@ def main():
             resume_global_step = global_step * args.gradient_accumulation_steps
             first_epoch = global_step // num_update_steps_per_epoch
             resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
-        
+
 
     # Bram Note: This was pretty janky to wrangle to look proper but works to my liking now
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
 
-        
+
     #### START MAIN TRAINING LOOP #####
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
@@ -1021,7 +1021,7 @@ def main():
                             feed_pixel_values = feed_pixel_values.flip(0)
                 elif args.train_method == 'sft':
                     feed_pixel_values = batch["pixel_values"]
-                
+
                 #### Diffusion Stuff ####
                 # encode pixels --> latents
                 with torch.no_grad():
@@ -1038,7 +1038,7 @@ def main():
                     )
                 if args.input_perturbation: # haven't tried yet
                     new_noise = noise + args.input_perturbation * torch.randn_like(noise)
-                    
+
                 bsz = latents.shape[0]
                 # Sample a random timestep for each image
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
@@ -1049,14 +1049,14 @@ def main():
                 elif 'turbo' in args.pretrained_model_name_or_path:
                     timesteps_0_to_3 = timesteps % 4
                     timesteps = 250 * timesteps_0_to_3 + 249
-                
+
                 if args.train_method == 'dpo': # make timesteps and noise same for pairs in DPO
                     timesteps = timesteps.chunk(2)[0].repeat(2)
                     noise = noise.chunk(2)[0].repeat(2, 1, 1, 1)
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
-                
+
                 noisy_latents = noise_scheduler.add_noise(latents,
                                                           new_noise if args.input_perturbation else noise,
                                                           timesteps)
@@ -1067,7 +1067,7 @@ def main():
                         # Need to compute "time_ids" https://github.com/huggingface/diffusers/blob/v0.20.0-release/examples/text_to_image/train_text_to_image_sdxl.py#L969
                         # for SDXL-base these are torch.tensor([args.resolution, args.resolution, *crop_coords_top_left, *target_size))
                         if 'refiner' in args.pretrained_model_name_or_path:
-                            add_time_ids = torch.tensor([args.resolution, 
+                            add_time_ids = torch.tensor([args.resolution,
                                                          args.resolution,
                                                          0,
                                                          0,
@@ -1075,18 +1075,18 @@ def main():
                                                          dtype=weight_dtype,
                                                          device=accelerator.device)[None, :].repeat(timesteps.size(0), 1)
                         else: # SDXL-base
-                            add_time_ids = torch.tensor([args.resolution, 
+                            add_time_ids = torch.tensor([args.resolution,
                                                          args.resolution,
                                                          0,
                                                          0,
-                                                          args.resolution, 
+                                                          args.resolution,
                                                          args.resolution],
                                                          dtype=weight_dtype,
                                                          device=accelerator.device)[None, :].repeat(timesteps.size(0), 1)
-                        prompt_batch = encode_prompt_sdxl(batch, 
+                        prompt_batch = encode_prompt_sdxl(batch,
                                                           text_encoders,
                                                            tokenizers,
-                                                           args.proportion_empty_prompts, 
+                                                           args.proportion_empty_prompts,
                                                           caption_column='caption',
                                                            is_train=True,
                                                           )
@@ -1101,16 +1101,16 @@ def main():
                     if args.train_method == 'dpo':
                         encoder_hidden_states = encoder_hidden_states.repeat(2, 1, 1)
                 #### END PREP BATCH ####
-                        
+
                 assert noise_scheduler.config.prediction_type == "epsilon"
                 target = noise
-               
+
                 # Make the prediction from the model we're learning
                 model_batch_args = (noisy_latents,
-                                    timesteps, 
+                                    timesteps,
                                     prompt_batch["prompt_embeds"] if args.sdxl else encoder_hidden_states)
                 added_cond_kwargs = unet_added_conditions if args.sdxl else None
-                
+
                 model_pred = unet(
                                 *model_batch_args,
                                   added_cond_kwargs = added_cond_kwargs
@@ -1126,9 +1126,9 @@ def main():
                     model_losses_w, model_losses_l = model_losses.chunk(2)
                     # below for logging purposes
                     raw_model_loss = 0.5 * (model_losses_w.mean() + model_losses_l.mean())
-                    
+
                     model_diff = model_losses_w - model_losses_l # These are both LBS (as is t)
-                    
+
                     with torch.no_grad(): # Get the reference policy (unet) prediction
                         ref_pred = ref_unet(
                                     *model_batch_args,
@@ -1137,15 +1137,15 @@ def main():
                         ref_losses = (ref_pred - target).pow(2).mean(dim=[1,2,3])
                         ref_losses_w, ref_losses_l = ref_losses.chunk(2)
                         ref_diff = ref_losses_w - ref_losses_l
-                        raw_ref_loss = ref_losses.mean()    
-                        
+                        raw_ref_loss = ref_losses.mean()
+
                     scale_term = -0.5 * args.beta_dpo
                     inside_term = scale_term * (model_diff - ref_diff)
                     implicit_acc = (inside_term > 0).sum().float() / inside_term.size(0)
                     loss = -1 * F.logsigmoid(inside_term).mean()
                 #### END LOSS COMPUTATION ###
-                    
-                # Gather the losses across all processes for logging 
+
+                # Gather the losses across all processes for logging
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
                 # Also gather:
