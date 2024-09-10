@@ -80,8 +80,9 @@ def parse_args():
     parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
     # logging
-    parser.add_argument("--output_dir", type=str, default="sd-model-finetuned", help="The output directory where the model predictions and checkpoints will be written.")
-    parser.add_argument("--wandb", type=str, default="whether to log wandb")
+    parser.add_argument("--tag", type=str, default=None, required=True)
+    parser.add_argument("--output_dir", type=str, default="output", help="The output directory where the model predictions and checkpoints will be written.")
+    parser.add_argument("--wandb", action='store_true', help="whether to log wandb")
     parser.add_argument("--tracker_project_name", type=str, default="personalized_diffusion", help="The `project_name` argument passed to Accelerator.init_trackers")
     # DPO
     parser.add_argument("--sft", action='store_true', help="Run Supervised Fine-Tuning instead of Direct Preference Optimization")
@@ -100,10 +101,13 @@ def parse_args():
         args.local_rank = env_local_rank
 
     args.train_method = 'sft' if args.sft else 'dpo'
+    args.output_dir = os.path.join(args.output_dir, args.tag)
     return args
 
 
 def main():
+    torch.backends.cuda.matmul.allow_tf32 = True
+
     args = parse_args()
     assert 'pickapic' in args.dataset_name # just for now
 
@@ -137,18 +141,29 @@ def main():
     if accelerator.is_main_process:
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
+    # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
+    # as these weights are only used for inference, keeping weights in full precision is not required.
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+        args.mixed_precision = accelerator.mixed_precision
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+        args.mixed_precision = accelerator.mixed_precision
     ### END ACCELERATOR BOILERPLATE
 
     ### START DIFFUSION BOILERPLATE ###
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
-    text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder='vae')
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler", torch_dtype=weight_dtype)
+    tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer", torch_dtype=weight_dtype)
+    text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder", torch_dtype=weight_dtype)
+    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder='vae', torch_dtype=weight_dtype)
     unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
     unet.enable_xformers_memory_efficient_attention()
     # clone of model
-    ref_unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
+    ref_unet = None
+    if args.train_method == 'dpo':
+        ref_unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet", torch_dtype=weight_dtype)
 
     # Freeze vae, text_encoder(s), reference unet
     vae.requires_grad_(False)
@@ -291,7 +306,6 @@ def main():
         dataset[args.split] = dataset[args.split].select(not_split_idx)
         new_len = dataset[args.split].num_rows
         print(f"Eliminated {orig_len - new_len}/{orig_len} split decisions for Pick-a-pic")
-
         if args.max_train_samples is not None:
             dataset[args.split] = dataset[args.split].shuffle(seed=args.seed).select(range(args.max_train_samples))
         # Set the training transforms
@@ -324,25 +338,15 @@ def main():
 
 
     #### START ACCELERATOR PREP ####
-    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        unet, optimizer, train_dataloader, lr_scheduler
+    vae, unet, text_encoder, ref_unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        vae, unet, text_encoder, ref_unet, optimizer, train_dataloader, lr_scheduler
     )
-
-    # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
-    # as these weights are only used for inference, keeping weights in full precision is not required.
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-        args.mixed_precision = accelerator.mixed_precision
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
-        args.mixed_precision = accelerator.mixed_precision
-
-    # Move text_encode and vae to gpu and cast to weight_dtype
-    vae.to(accelerator.device, dtype=weight_dtype)
-    text_encoder.to(accelerator.device, dtype=weight_dtype)
-    if args.train_method == 'dpo':
-        ref_unet.to(accelerator.device, dtype=weight_dtype)
+    # for x in [vae, unet, text_encoder, ref_unet]: print(x.device)
+    # for x in [vae, unet, text_encoder, ref_unet]: print(x.dtype)
+    # for p in vae.parameters(): assert not p.requires_grad
+    # for p in text_encoder.parameters(): assert not p.requires_grad
+    # for p in unet.parameters(): assert p.requires_grad
+    # for p in ref_unet.parameters(): assert not p.requires_grad
     ### END ACCELERATOR PREP ###
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
@@ -356,7 +360,11 @@ def main():
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
         tracker_config = dict(vars(args))
-        accelerator.init_trackers(args.tracker_project_name, tracker_config)
+        accelerator.init_trackers(
+            args.tracker_project_name,
+            tracker_config,
+            init_kwargs={"wandb": {"name": args.tag}}
+        )
 
     # Training initialization
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -414,7 +422,8 @@ def main():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
                 ### START PREP BATCH ###
                 # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                with torch.no_grad():
+                    encoder_hidden_states = text_encoder(batch["input_ids"])[0]
                 if args.train_method == 'dpo':
                     encoder_hidden_states = encoder_hidden_states.repeat(2, 1, 1)
                 #### END PREP BATCH ####
