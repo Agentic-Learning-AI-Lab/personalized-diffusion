@@ -166,3 +166,6 @@ cython_debug/
 pick_a_pic_v2/
 wandb/
 *out*
+*.jpg
+*.png
+*.txt
