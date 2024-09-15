@@ -1,4 +1,3 @@
-# mainly to debug model saving and loading, just train 2 steps
 export MODEL_NAME="pt-sk/stable-diffusion-1.5"
 export DATASET_NAME="yuvalkirstain/pickapic_v2"
 
@@ -8,18 +7,18 @@ export DATASET_NAME="yuvalkirstain/pickapic_v2"
 accelerate launch --mixed_precision="fp16" train.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --dataset_name=$DATASET_NAME \
-  --train_batch_size=16 \
-  --max_train_steps=10000 \
-  --lr_scheduler="constant_with_warmup" --lr_warmup_steps=0 \
+  --train_batch_size=8 \
+  --max_train_steps=2000 \
+  --checkpointing_steps=500 \
+  --lr_scheduler="constant_with_warmup" --lr_warmup_steps=500 \
   --learning_rate=1e-8 --scale_lr \
   --cache_dir="./pick_a_pic_v2/" \
   --allow_tf32 \
   --dataloader_num_worker=16 \
-  --gradient_accumulation_steps 4 \
+  --gradient_accumulation_steps 128 \
   --max_train_samples 100000 \
-  --max_valid_samples 100 \
-  --max_valid_captions 10 \
-  --num_inference_steps 10 \
-  --tag 0910_dpo_debug \
-  --checkpointing_steps 1000 \
+  --tag 0914_dpo_2gpu_lora \
+  --lora_rank 4 \
   --wandb
+
+# 80hrs on 2 A100

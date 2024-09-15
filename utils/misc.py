@@ -17,6 +17,12 @@ def chunks(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
+def count_param_in_model(model, trainable_only=True):
+    count = 0
+    for p in model.parameters():
+        if not trainable_only or p.requires_grad:
+            count += torch.numel(p)
+    return count
 
 def compute_loss_sft(model_pred, target):
     return F.mse_loss(model_pred.float(), target.float(), reduction="mean")

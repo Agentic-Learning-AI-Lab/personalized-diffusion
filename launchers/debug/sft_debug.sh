@@ -9,7 +9,7 @@ accelerate launch --mixed_precision="fp16" train.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --dataset_name=$DATASET_NAME \
   --train_batch_size=16 \
-  --max_train_steps=10000 \
+  --max_train_steps=3 \
   --lr_scheduler="constant_with_warmup" --lr_warmup_steps=0 \
   --learning_rate=1e-8 --scale_lr \
   --cache_dir="./pick_a_pic_v2/" \
@@ -17,10 +17,8 @@ accelerate launch --mixed_precision="fp16" train.py \
   --dataloader_num_worker=16 \
   --gradient_accumulation_steps 4 \
   --max_train_samples 100000 \
-  --max_valid_samples 100 \
-  --max_valid_captions 10 \
   --num_inference_steps 10 \
-  --tag 0910_dpo_debug_lora \
-  --checkpointing_steps 1000 \
-  --lora_rank 4 \
+  --tag 0910_dpo_debug \
+  --checkpointing_steps 10 \
+  --sft \
   --wandb

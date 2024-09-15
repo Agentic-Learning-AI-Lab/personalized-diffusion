@@ -1,5 +1,4 @@
 # TODO: SDXL
-# TODO: test multi-gpu (should be fine for eval)
 
 #!/usr/bin/env python
 # coding=utf-8
@@ -45,7 +44,7 @@ from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNe
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, convert_state_dict_to_diffusers
 
-from utils.misc import cast_training_params, chunks, compute_loss_sft, compute_loss_dpo
+from utils.misc import cast_training_params, chunks, compute_loss_sft, compute_loss_dpo, count_param_in_model
 from utils.pickscore_utils import Selector as PickScoreSelector
 
 import wandb
@@ -72,6 +71,7 @@ def parse_args():
     parser.add_argument("--random_crop", default=False, action="store_true", help="If set the images will be randomly cropped (instead of center), images resized before cropping")
     parser.add_argument("--no_hflip", action="store_true", help="whether to supress horizontal flipping")
     parser.add_argument("--train_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader.")
+    parser.add_argument("--valid_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader.")
     parser.add_argument("--dataloader_num_workers", type=int, default=16, help="Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process.")
     # training
     parser.add_argument("--num_train_epochs", type=int, default=100)
@@ -98,7 +98,7 @@ def parse_args():
     parser.add_argument("--beta_dpo", type=float, default=5000, help="The beta DPO temperature controlling strength of KL penalty")
     parser.add_argument("--proportion_empty_prompts", type=float, default=0.0, help="Proportion of image prompts to be replaced with empty strings. Defaults to 0 (no prompt replacement).")
     parser.add_argument("--train_split", type=str, default='train', help="training split")
-    parser.add_argument("--valid_split", type=str, default='validation', help="validation split")
+    parser.add_argument("--valid_split", type=str, default='validation_unique', help="validation split")
     # misc
     parser.add_argument("--seed", type=int, default=831, help="A seed for reproducible training.")
     parser.add_argument("--allow_tf32", action="store_true", help="Whether or not to allow TF32 on Ampere GPUs.")
@@ -166,7 +166,7 @@ def main():
 
     def save_model(unet, save_path):
         if args.lora_rank > 0:
-            print('saving lora model')
+            logger.info('saving lora model')
             unwrapped_unet = accelerator.unwrap_model(unet)
             unet_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unwrapped_unet))
             StableDiffusionPipeline.save_lora_weights(
@@ -176,7 +176,7 @@ def main():
             )
             unet.save_attn_procs(save_path)
         else:
-            print('saving unet model (no lora)')
+            logger.info('saving unet model (no lora)')
             accelerator.save_state(save_path)
 
     ### START DIFFUSION BOILERPLATE ###
@@ -330,7 +330,7 @@ def main():
         not_split_idx = [i for i, label_0 in enumerate(dataset[split]['label_0']) if label_0 in (0, 1)]
         dataset[split] = dataset[split].select(not_split_idx)
         new_len = dataset[split].num_rows
-        print(f"Eliminated {orig_len - new_len}/{orig_len} in Pick-a-pic split {split}")
+        logger.info(f"Eliminated {orig_len - new_len}/{orig_len} in Pick-a-pic split {split}")
 
     ### DATASET #####
     with accelerator.main_process_first():
@@ -350,7 +350,7 @@ def main():
     random.shuffle(all_valid_captions)
     if args.max_valid_captions is not None:
         all_valid_captions = all_valid_captions[:args.max_valid_captions]
-    n_valid_batches = math.ceil(len(all_valid_captions) / args.train_batch_size)
+    n_valid_batches = math.ceil(len(all_valid_captions) / args.valid_batch_size)
     # save validation captions
     with open(os.path.join(args.output_dir, 'captions.txt'), 'w') as f:
         f.write('\n'.join(all_valid_captions))
@@ -368,7 +368,7 @@ def main():
         valid_dataset,
         shuffle=False,
         collate_fn=collate_fn,
-        batch_size=args.train_batch_size,
+        batch_size=args.valid_batch_size,
         num_workers=args.dataloader_num_workers,
         drop_last=False
     )
@@ -392,8 +392,8 @@ def main():
     vae, unet, text_encoder, ref_unet, optimizer, train_dataloader, valid_dataloader, lr_scheduler = accelerator.prepare(
         vae, unet, text_encoder, ref_unet, optimizer, train_dataloader, valid_dataloader, lr_scheduler
     )
-    # for x in [vae, unet, text_encoder, ref_unet]: print(x.device)
-    # for x in [vae, unet, text_encoder, ref_unet]: print(x.dtype)
+    # for x in [vae, unet, text_encoder, ref_unet]: logger.info(x.device)
+    # for x in [vae, unet, text_encoder, ref_unet]: logger.info(x.dtype)
     # for p in vae.parameters(): assert not p.requires_grad
     # for p in text_encoder.parameters(): assert not p.requires_grad
     # for p in unet.parameters(): assert p.requires_grad
@@ -426,7 +426,7 @@ def main():
             args.pretrained_model_name_or_path,
             text_encoder=text_encoder,
             vae=vae,
-            unet=unet, # PNDMScheduler
+            unet=accelerator.unwrap_model(unet), # PNDMScheduler
         ).to(accelerator.device)
         pipeline.set_progress_bar_config(disable=True)
         pipeline.enable_xformers_memory_efficient_attention()
@@ -434,10 +434,11 @@ def main():
 
         all_valid_imgs = []
         with torch.autocast("cuda"):
-            for valid_captions in tqdm(chunks(all_valid_captions, args.train_batch_size), total=n_valid_batches):
+            for valid_captions in tqdm(chunks(all_valid_captions, args.valid_batch_size), total=n_valid_batches):
                 valid_imgs = pipeline(valid_captions, num_inference_steps=args.num_inference_steps, generator=generator).images
                 all_valid_imgs += valid_imgs
         diffusers.utils.logging.set_verbosity_warning()
+        del pipeline
         return all_valid_imgs
 
     @torch.no_grad()
@@ -445,7 +446,7 @@ def main():
         all_valid_imgs_n_captions = list(zip(valid_imgs, all_valid_captions))
         all_scores = []
         with torch.autocast("cuda"):
-            for valid_imgs_n_captions in tqdm(chunks(all_valid_imgs_n_captions, args.train_batch_size), total=n_valid_batches):
+            for valid_imgs_n_captions in tqdm(chunks(all_valid_imgs_n_captions, args.valid_batch_size), total=n_valid_batches):
                 valid_imgs, valid_captions = [x[0] for x in valid_imgs_n_captions], [x[1] for x in valid_imgs_n_captions]
                 all_scores += pickscore_model.score(valid_imgs, valid_captions)
         return torch.median(torch.tensor(all_scores)).item()
@@ -470,6 +471,7 @@ def main():
 
     # Training initialization
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    n_trainable_params = count_param_in_model(unet, trainable_only=True)
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
@@ -478,6 +480,8 @@ def main():
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    logger.info(f"  Total number of parameters to train = {n_trainable_params}") # 797184 for lora4, 3188736 for lora16, 859520964 for unet
+
     global_step = 0
     first_epoch = 0
 
@@ -592,6 +596,7 @@ def main():
 
                         # validation
                         # part 1: generate some images from unet and ref unet, upload few to wandb
+                        logger.info('\ngenerating some valid images from unet')
                         unet_valid_imgs = generate_valid_images(unet)
                         for i, img in enumerate(unet_valid_imgs): img.save(os.path.join(val_dir, f'unet_{i}.jpg'))
                         accelerator.log({
@@ -599,8 +604,8 @@ def main():
                         }, step=global_step)
 
                         # if first time, log ref unet performance
-                        print('\ngenerating some valid images')
                         if global_step == args.checkpointing_steps:
+                            logger.info('\ngenerating some valid images from ref unet')
                             ref_valid_imgs = generate_valid_images(ref_unet)
                             for i, img in enumerate(ref_valid_imgs): img.save(os.path.join(val_dir, f'ref_{i}.jpg'))
                             accelerator.log({
@@ -608,7 +613,7 @@ def main():
                             }, step=global_step)
 
                         # part 2: median pickscore reward
-                        print('\ncomputing unet median pickscore')
+                        logger.info('\ncomputing median pickscore from unet')
                         unet_median_pickscore = compute_median_pickscore_reward(unet_valid_imgs)
                         with open(os.path.join(val_dir, 'unet_pickscore.txt'), 'w') as f:
                             f.write(str(unet_median_pickscore))
@@ -616,15 +621,15 @@ def main():
 
                         # if first time, log ref unet performance
                         if global_step == args.checkpointing_steps:
-                            print('\ncomputing ref median pickscore')
+                            logger.info('\ncomputing median pickscore from ref unet')
                             ref_median_pickscore = compute_median_pickscore_reward(ref_valid_imgs)
                             with open(os.path.join(val_dir, 'ref_pickscore.txt'), 'w') as f:
                                 f.write(str(ref_median_pickscore))
                             accelerator.log({"ref_median_pickscore": ref_median_pickscore}, step=global_step)
 
                         # part 3: estimate implicit acc with 10 random timesteps for pickapic validation set
-                        print('\ncomputing unet implicit accuracy')
-                        unet_implicit_acc = compute_valid_implicit_acc(unet, ref_unet)
+                        logger.info('\ncomputing unet implicit accuracy from unet')
+                        unet_implicit_acc = sum(compute_valid_implicit_acc(unet, ref_unet) for _ in range(10)) / 10
                         with open(os.path.join(val_dir, 'unet_implicit_acc.txt'), 'w') as f:
                             f.write(str(unet_implicit_acc))
                         accelerator.log({"unet_implicit_acc": unet_implicit_acc}, step=global_step)

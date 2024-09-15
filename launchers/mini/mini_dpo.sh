@@ -7,8 +7,9 @@ export DATASET_NAME="yuvalkirstain/pickapic_v2"
 accelerate launch --mixed_precision="fp16" train.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --dataset_name=$DATASET_NAME \
-  --train_batch_size=32 \
-  --max_train_steps=2000 \
+  --train_batch_size=16 \
+  --max_train_steps=1000000 \
+  --checkpointing_steps=500 \
   --lr_scheduler="constant_with_warmup" --lr_warmup_steps=500 \
   --learning_rate=1e-8 --scale_lr \
   --cache_dir="./pick_a_pic_v2/" \
@@ -16,6 +17,5 @@ accelerate launch --mixed_precision="fp16" train.py \
   --dataloader_num_worker=16 \
   --gradient_accumulation_steps 16 \
   --max_train_samples 100000 \
-  --tag 0910_sft \
-  --sft \
+  --tag 0914_mini_dpo \
   --wandb
