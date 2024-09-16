@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=2
 #SBATCH --cpus-per-task=16
 #SBATCH --time=96:00:00
-#SBATCH --mem=32GB
+#SBATCH --mem=64GB
 #SBATCH --gres=gpu:2
 #SBATCH --job-name=0914_dpo_2gpu
 

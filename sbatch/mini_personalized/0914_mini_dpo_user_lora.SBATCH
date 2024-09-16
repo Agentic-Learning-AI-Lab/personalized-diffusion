@@ -2,12 +2,12 @@
 
 #SBATCH --constraint='a100|h100'
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=2
+#SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
-#SBATCH --time=96:00:00
+#SBATCH --time=48:00:00
 #SBATCH --mem=64GB
-#SBATCH --gres=gpu:2
-#SBATCH --job-name=0914_dpo_2gpu_lora
+#SBATCH --gres=gpu:1
+#SBATCH --job-name=0915_mini_dpo_user_lora
 
 module purge
 
@@ -16,6 +16,6 @@ singularity exec --nv \
     --overlay /scratch/work/public/ml-datasets/imagenet/imagenet-val.sqf:ro \
     /scratch/work/public/singularity/cuda11.6.124-cudnn8.4.0.27-devel-ubuntu20.04.4.sif \
     /bin/bash -c "source /ext3/env.sh; cd /scratch/yl11330/personalized_diffusion; conda activate ./penv; \
-        ./launchers/repro/dpo_2gpu_lora.sh"
+        ./launchers/mini_personalized/mini_dpo_user_lora.sh"
 
-# 51027921
+# 51038009 (me)

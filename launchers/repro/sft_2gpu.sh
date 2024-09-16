@@ -8,6 +8,7 @@ accelerate launch --mixed_precision="fp16" train.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --dataset_name=$DATASET_NAME \
   --train_batch_size=8 \
+  --valid_batch_size=8 \
   --max_train_steps=2000 \
   --checkpointing_steps=500 \
   --lr_scheduler="constant_with_warmup" --lr_warmup_steps=500 \

@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --time=48:00:00
-#SBATCH --mem=32GB
+#SBATCH --mem=64GB
 #SBATCH --gres=gpu:1
 #SBATCH --job-name=0914_mini_sft_lora
 

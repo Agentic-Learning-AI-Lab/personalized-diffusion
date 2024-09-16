@@ -23,6 +23,7 @@ import math
 import os
 import random
 import math
+from collections import defaultdict, Counter
 
 import datasets
 import numpy as np
@@ -63,10 +64,8 @@ def parse_args():
     parser.add_argument("--pretrained_model_name_or_path", type=str, default=None, required=True, help="Path to pretrained model or model identifier from huggingface.co/models.")
     parser.add_argument("--lora_rank", type=int, default=-1, help="The dimension of the LoRA update matrices.")
     # data
-    parser.add_argument("--dataset_name", type=str, default=None)
+    parser.add_argument("--dataset_name", type=str, default='yuvalkirstain/pickapic_v2')
     parser.add_argument("--cache_dir", type=str, default=None, help="The directory where the downloaded models and datasets will be stored.")
-    parser.add_argument("--max_train_samples", type=int, default=None, help="For debugging purposes or quicker training, truncate the number of training examples.")
-    parser.add_argument("--max_valid_samples", type=int, default=None, help="For debugging purposes or quicker evaluation, truncate the number of evaluation examples.")
     parser.add_argument("--max_valid_captions", type=int, default=None, help="For debugging purposes or quicker evaluation, truncate the number of evaluation examples.")
     parser.add_argument("--resolution", type=int, default=512, help="The resolution for input images")
     parser.add_argument("--random_crop", default=False, action="store_true", help="If set the images will be randomly cropped (instead of center), images resized before cropping")
@@ -75,8 +74,7 @@ def parse_args():
     parser.add_argument("--valid_batch_size", type=int, default=1, help="Batch size (per device) for the training dataloader.")
     parser.add_argument("--dataloader_num_workers", type=int, default=16, help="Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process.")
     # training
-    parser.add_argument("--num_train_epochs", type=int, default=100, help='number of epochs to train')
-    parser.add_argument("--max_train_steps", type=int, default=2000, help="Total number of training steps to perform.  If provided, overrides num_train_epochs.")
+    parser.add_argument("--max_train_steps", type=int, default=2000, help="Total number of training steps to perform.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Number of updates steps to accumulate before performing a backward/update pass.")
     parser.add_argument("--checkpointing_steps", type=int, default=500, help="Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming")
     # optimizer
@@ -98,8 +96,6 @@ def parse_args():
     parser.add_argument("--sft", action='store_true', help="Run Supervised Fine-Tuning instead of Direct Preference Optimization")
     parser.add_argument("--beta_dpo", type=float, default=5000, help="The beta DPO temperature controlling strength of KL penalty")
     parser.add_argument("--proportion_empty_prompts", type=float, default=0.0, help="Proportion of image prompts to be replaced with empty strings. Defaults to 0 (no prompt replacement).")
-    parser.add_argument("--train_split", type=str, default='train', help="training split")
-    parser.add_argument("--valid_split", type=str, default='validation_unique', help="validation split")
     # misc
     parser.add_argument("--seed", type=int, default=831, help="A seed for reproducible training.")
     parser.add_argument("--allow_tf32", action="store_true", help="Whether or not to allow TF32 on Ampere GPUs.")
@@ -108,6 +104,11 @@ def parse_args():
     # eval
     parser.add_argument("--num_inference_steps", type=int, default=50, help="Number of inference steps")
     parser.add_argument("--n_log_valid_imgs", type=int, default=10, help="Number generated images to log in evaluation")
+    # user preference training
+    parser.add_argument("--max_user_proportion", type=float, default=1.0, help='proportion of user to keep, used to subset our dataset')
+    parser.add_argument("--per_user_contribution_thr", type=int, default=200, help='users with less contribution than this threshold are put into validation')
+    parser.add_argument("--per_user_n_eval", type=int, default=100, help='number of evaluation samples per user')
+
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -115,6 +116,9 @@ def parse_args():
 
     args.train_method = 'sft' if args.sft else 'dpo'
     args.output_dir = os.path.join(args.output_dir, args.tag)
+
+    assert args.per_user_n_eval < args.per_user_contribution_thr
+    assert 0.0 <= args.max_user_proportion <= 1.0
     return args
 
 
@@ -229,20 +233,13 @@ def main():
 
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(args.dataset_name, cache_dir=args.cache_dir)
-    else:
-        dataset = load_dataset("imagefolder", cache_dir=args.cache_dir)
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
+    dataset = load_dataset(args.dataset_name, cache_dir=args.cache_dir)
 
     # Preprocessing the datasets.
     # We need to tokenize input captions and transform the images.
-    caption_column = 'caption'
     def tokenize_captions(examples, is_train=True):
         captions = []
-        for caption in examples[caption_column]:
+        for caption in examples['caption']:
             if random.random() < args.proportion_empty_prompts:
                 captions.append("")
             elif isinstance(caption, str):
@@ -251,7 +248,7 @@ def main():
                 # take a random caption if there are multiple
                 captions.append(random.choice(caption) if is_train else caption[0])
             else:
-                raise ValueError(f"Caption column `{caption_column}` should contain either strings or lists of strings.")
+                raise ValueError(f"Caption column `caption` should contain either strings or lists of strings.")
         inputs = tokenizer(captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt")
         return inputs.input_ids
 
@@ -312,6 +309,7 @@ def main():
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
         return_d =  {"pixel_values": pixel_values}
         return_d["input_ids"] = torch.stack([example["input_ids"] for example in examples])
+        return_d["user_ids"] = torch.tensor([example['user_id'] for example in examples])
         return return_d
 
     if args.train_method == 'dpo':
@@ -325,47 +323,92 @@ def main():
         return preprocess_data_dpo(examples, valid_transforms)
     #### END PREPROCESSING/COLLATION ####
 
-    def remove_split_label(split):
-        orig_len = dataset[split].num_rows
-        not_split_idx = [i for i, label_0 in enumerate(dataset[split]['label_0']) if label_0 in (0, 1)]
-        dataset[split] = dataset[split].select(not_split_idx)
-        new_len = dataset[split].num_rows
-        logger.info(f"Eliminated {orig_len - new_len}/{orig_len} in Pick-a-pic split {split}")
+    def remove_split_label(dataset):
+        # eliminate no-decisions (0.5-0.5 labels)
+        orig_len = dataset.num_rows
+        not_split_idx = [i for i, label_0 in enumerate(dataset['label_0']) if label_0 in (0, 1)]
+        dataset = dataset.select(not_split_idx)
+        new_len = dataset.num_rows
+        logger.info(f"Eliminated {orig_len - new_len}/{orig_len} in Pick-a-pic")
+        return dataset
+
+    def sample_from_list(l, n):
+        # sample n items from l, return remaining items too
+        indices = list(range(len(l)))
+        yes_indices = random.sample(indices, n)
+        no_indices = [i for i in indices if i not in set(yes_indices)]
+        return [l[i] for i in yes_indices], [l[i] for i in no_indices]
 
     ### DATASET #####
     with accelerator.main_process_first():
-        # eliminate no-decisions (0.5-0.5 labels)
-        remove_split_label(args.train_split)
-        remove_split_label(args.valid_split)
-        if args.max_train_samples is not None:
-            dataset[args.train_split] = dataset[args.train_split].shuffle(seed=args.seed).select(range(args.max_train_samples))
-        if args.max_valid_samples is not None:
-            dataset[args.valid_split] = dataset[args.valid_split].shuffle(seed=args.seed).select(range(args.max_valid_samples))
-        # Set the training transforms
-        train_dataset = dataset[args.train_split].with_transform(preprocess_train)
-        valid_dataset = dataset[args.valid_split].with_transform(preprocess_valid)
+        dataset = datasets.concatenate_datasets([dataset['train'], dataset['validation'], dataset['test']])
+        dataset = remove_split_label(dataset)
+        # subset users for debug/mini runs
+        unique_user_ids = list(set(dataset['user_id']))
+        select_user_ids = random.sample(unique_user_ids, math.ceil(len(unique_user_ids) * args.max_user_proportion))
+        select_ids = [i for i, u in enumerate(dataset['user_id']) if u in set(select_user_ids)]
+        dataset = dataset.select(select_ids)
+        # split into known user train and valid
+        user_id_counts = Counter(dataset['user_id'])
+        known_user_to_ids = defaultdict(list)
+        for i, u in enumerate(dataset['user_id']):
+            if user_id_counts[u] >= args.per_user_contribution_thr:
+                known_user_to_ids[u].append(i)
+        assert all(len(v) >= args.per_user_contribution_thr for v in known_user_to_ids.values())
+        known_train_ids, known_val_ids = [], []
+        for _, ids in known_user_to_ids.items():
+            x, y = sample_from_list(ids, args.per_user_n_eval)
+            known_train_ids += y
+            known_val_ids += x
+        # get unknown user valid
+        unknown_ids = [i for i, u in enumerate(dataset['user_id']) if user_id_counts[u] < args.per_user_contribution_thr]
+        # build dataset
+        known_train_dataset = dataset.select(known_train_ids).shuffle(seed=args.seed)
+        known_valid_dataset = dataset.select(known_val_ids).shuffle(seed=args.seed)
+        unknown_valid_dataset = dataset.select(unknown_ids).shuffle(seed=args.seed)
+        logger.info(f'Known train dataset size: {len(known_train_dataset)}')
+        logger.info(f'Known valid dataset size: {len(known_valid_dataset)}')
+        logger.info(f'Unknown valid dataset size: {len(unknown_valid_dataset)}')
+        assert len(known_train_dataset) + len(known_valid_dataset) + len(unknown_valid_dataset) == len(dataset)
+        # transform
+        known_train_dataset_transformed = known_train_dataset.with_transform(preprocess_train)
+        known_valid_dataset_transformed = known_valid_dataset.with_transform(preprocess_valid)
+        unknown_valid_dataset_transformed = unknown_valid_dataset.with_transform(preprocess_valid)
 
     # get the 500 unique validation captions for evaluation
-    all_valid_captions = sorted(set(dataset[args.valid_split][caption_column])) # deterministic
-    random.shuffle(all_valid_captions)
+    all_known_valid_captions = sorted(set(known_valid_dataset['caption'])) # deterministic
+    all_unknown_valid_captions = sorted(set(unknown_valid_dataset['caption'])) # deterministic
+    random.shuffle(all_known_valid_captions)
+    random.shuffle(all_unknown_valid_captions)
     if args.max_valid_captions is not None:
-        all_valid_captions = all_valid_captions[:args.max_valid_captions]
-    n_valid_batches = math.ceil(len(all_valid_captions) / args.valid_batch_size)
+        all_known_valid_captions = all_known_valid_captions[:args.max_valid_captions]
+    if args.max_valid_captions is not None:
+        all_unknown_valid_captions = all_unknown_valid_captions[:args.max_valid_captions]
     # save validation captions
-    with open(os.path.join(args.output_dir, 'captions.txt'), 'w') as f:
-        f.write('\n'.join(all_valid_captions))
+    with open(os.path.join(args.output_dir, 'all_known_valid_captions.txt'), 'w') as f:
+        f.write('\n'.join(all_known_valid_captions))
+    with open(os.path.join(args.output_dir, 'all_unknown_valid_captions.txt'), 'w') as f:
+        f.write('\n'.join(all_unknown_valid_captions))
 
     # DataLoaders creation:
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
+    known_train_dataloader = torch.utils.data.DataLoader(
+        known_train_dataset_transformed,
         shuffle=True,
         collate_fn=collate_fn,
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
         drop_last=True
     )
-    valid_dataloader = torch.utils.data.DataLoader(
-        valid_dataset,
+    known_valid_dataloader = torch.utils.data.DataLoader(
+        known_valid_dataset_transformed,
+        shuffle=False,
+        collate_fn=collate_fn,
+        batch_size=args.valid_batch_size,
+        num_workers=args.dataloader_num_workers,
+        drop_last=False
+    )
+    unknown_valid_dataloader = torch.utils.data.DataLoader(
+        unknown_valid_dataset_transformed,
         shuffle=False,
         collate_fn=collate_fn,
         batch_size=args.valid_batch_size,
@@ -373,13 +416,6 @@ def main():
         drop_last=False
     )
     ##### END BIG OLD DATASET BLOCK #####
-
-    # Scheduler and math around the number of training steps.
-    overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-        overrode_max_train_steps = True
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
@@ -389,8 +425,8 @@ def main():
     )
 
     #### START ACCELERATOR PREP ####
-    vae, unet, text_encoder, ref_unet, optimizer, train_dataloader, valid_dataloader, lr_scheduler = accelerator.prepare(
-        vae, unet, text_encoder, ref_unet, optimizer, train_dataloader, valid_dataloader, lr_scheduler
+    vae, unet, text_encoder, ref_unet, optimizer, known_train_dataloader, known_valid_dataloader, unknown_valid_dataloader, lr_scheduler = accelerator.prepare(
+        vae, unet, text_encoder, ref_unet, optimizer, known_train_dataloader, known_valid_dataloader, unknown_valid_dataloader, lr_scheduler
     )
     # for x in [vae, unet, text_encoder, ref_unet]: logger.info(x.device)
     # for x in [vae, unet, text_encoder, ref_unet]: logger.info(x.dtype)
@@ -401,9 +437,7 @@ def main():
     ### END ACCELERATOR PREP ###
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if overrode_max_train_steps:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    num_update_steps_per_epoch = math.ceil(len(known_train_dataloader) / args.gradient_accumulation_steps)
     # Afterwards we recalculate our number of training epochs
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
@@ -419,7 +453,7 @@ def main():
 
     # validation utils
     @torch.no_grad()
-    def generate_valid_images(unet):
+    def generate_images(unet, captions, batch_size):
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
         diffusers.utils.logging.set_verbosity_error()
         pipeline = StableDiffusionPipeline.from_pretrained(
@@ -432,29 +466,30 @@ def main():
         pipeline.enable_xformers_memory_efficient_attention()
         pipeline.safety_checker = None # disable nsfw
 
-        all_valid_imgs = []
+        imgs = []
         with torch.autocast("cuda"):
-            for valid_captions in tqdm(chunks(all_valid_captions, args.valid_batch_size), total=n_valid_batches):
-                valid_imgs = pipeline(valid_captions, num_inference_steps=args.num_inference_steps, generator=generator).images
-                all_valid_imgs += valid_imgs
+            n_batches = math.ceil(len(captions) / batch_size)
+            for caps in tqdm(chunks(captions, batch_size), total=n_batches):
+                imgs = pipeline(caps, num_inference_steps=args.num_inference_steps, generator=generator).images
         diffusers.utils.logging.set_verbosity_warning()
         del pipeline
-        return all_valid_imgs
+        return imgs
 
     @torch.no_grad()
-    def compute_median_pickscore_reward(valid_imgs):
-        all_valid_imgs_n_captions = list(zip(valid_imgs, all_valid_captions))
+    def compute_median_pickscore_reward(imgs, captions, batch_size):
+        all_imgs_n_captions = list(zip(imgs, captions))
         all_scores = []
         with torch.autocast("cuda"):
-            for valid_imgs_n_captions in tqdm(chunks(all_valid_imgs_n_captions, args.valid_batch_size), total=n_valid_batches):
-                valid_imgs, valid_captions = [x[0] for x in valid_imgs_n_captions], [x[1] for x in valid_imgs_n_captions]
-                all_scores += pickscore_model.score(valid_imgs, valid_captions)
+            n_batches = math.ceil(len(all_imgs_n_captions) / batch_size)
+            for imgs_n_captions in tqdm(chunks(all_imgs_n_captions, batch_size), total=n_batches):
+                imgs, caps = [x[0] for x in imgs_n_captions], [x[1] for x in imgs_n_captions]
+                all_scores += pickscore_model.score(imgs, caps)
         return torch.median(torch.tensor(all_scores)).item()
 
     @torch.no_grad()
-    def compute_valid_implicit_acc(unet, ref_unet):
+    def compute_implicit_acc(unet, ref_unet, dataloader):
         avg_implicit_acc = 0
-        for step, batch in tqdm(enumerate(valid_dataloader), total=len(valid_dataloader)):
+        for batch in tqdm(dataloader, total=len(dataloader)):
             feed_pixel_values = torch.cat(batch["pixel_values"].chunk(2, dim=1))
             latents = vae.encode(feed_pixel_values.to(weight_dtype)).latent_dist.sample() * vae.config.scaling_factor
             encoder_hidden_states = text_encoder(batch["input_ids"])[0].repeat(2, 1, 1)
@@ -467,14 +502,14 @@ def main():
             model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
             _, _, _, implicit_acc = compute_loss_dpo(args, model_pred, target, ref_unet, encoder_hidden_states, noisy_latents, timesteps)
             avg_implicit_acc += implicit_acc * batch["input_ids"].shape[0]
-        return avg_implicit_acc / len(valid_dataset)
+        return avg_implicit_acc / len(dataloader.dataset)
 
     # Training initialization
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
     n_trainable_params = count_param_in_model(unet, trainable_only=True)
 
     logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num examples = {len(known_train_dataset_transformed)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
@@ -483,18 +518,17 @@ def main():
     logger.info(f"  Total number of parameters to train = {n_trainable_params}") # 797184 for lora4, 3188736 for lora16, 859520964 for unet
 
     global_step = 0
-    first_epoch = 0
 
     # Bram Note: This was pretty janky to wrangle to look proper but works to my liking now
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
 
     #### START MAIN TRAINING LOOP #####
-    for epoch in range(first_epoch, args.num_train_epochs):
+    for epoch in range(args.num_train_epochs):
         unet.train()
         train_loss = 0.0
         implicit_acc_accumulated = 0.0
-        for step, batch in enumerate(train_dataloader):
+        for step, batch in enumerate(known_train_dataloader):
             with accelerator.accumulate(unet):
                 # Convert images to latent space
                 if args.train_method == 'dpo':
@@ -596,43 +630,66 @@ def main():
 
                         # validation
                         # part 1: generate some images from unet and ref unet, upload few to wandb
-                        logger.info('\ngenerating some valid images from unet')
-                        unet_valid_imgs = generate_valid_images(unet)
-                        for i, img in enumerate(unet_valid_imgs): img.save(os.path.join(val_dir, f'unet_{i}.jpg'))
+                        logger.info('generating known valid images from unet')
+                        unet_known_valid_imgs = generate_images(unet, all_known_valid_captions, args.valid_batch_size)
+                        logger.info('generating unknown valid images from unet')
+                        unet_unknown_valid_imgs = generate_images(unet, all_unknown_valid_captions, args.valid_batch_size)
+                        for i, img in enumerate(unet_known_valid_imgs): img.save(os.path.join(val_dir, f'unet_known_{i}.jpg'))
+                        for i, img in enumerate(unet_unknown_valid_imgs): img.save(os.path.join(val_dir, f'unet_unknown_{i}.jpg'))
                         accelerator.log({
-                            "unet_valid_images": [wandb.Image(img, caption=f"{i}: {all_valid_captions[i]}") for i, img in enumerate(unet_valid_imgs[:args.n_log_valid_imgs])],
+                            "unet_known_valid_images": [wandb.Image(img, caption=f"{i}: {all_known_valid_captions[i]}") for i, img in enumerate(unet_known_valid_imgs[:args.n_log_valid_imgs])],
+                            "unet_unknown_valid_images": [wandb.Image(img, caption=f"{i}: {all_unknown_valid_captions[i]}") for i, img in enumerate(unet_unknown_valid_imgs[:args.n_log_valid_imgs])],
                         }, step=global_step)
 
                         # if first time, log ref unet performance
                         if global_step == args.checkpointing_steps:
-                            logger.info('\ngenerating some valid images from ref unet')
-                            ref_valid_imgs = generate_valid_images(ref_unet)
-                            for i, img in enumerate(ref_valid_imgs): img.save(os.path.join(val_dir, f'ref_{i}.jpg'))
+                            logger.info('generating known valid images from ref')
+                            ref_known_valid_imgs = generate_images(ref_unet, all_known_valid_captions, args.valid_batch_size)
+                            logger.info('generating unknown valid images from ref')
+                            ref_unknown_valid_imgs = generate_images(ref_unet, all_unknown_valid_captions, args.valid_batch_size)
+                            for i, img in enumerate(ref_known_valid_imgs): img.save(os.path.join(val_dir, f'ref_known_{i}.jpg'))
+                            for i, img in enumerate(ref_unknown_valid_imgs): img.save(os.path.join(val_dir, f'ref_unknown_{i}.jpg'))
                             accelerator.log({
-                                "ref_valid_images": [wandb.Image(img, caption=f"{i}: {all_valid_captions[i]}") for i, img in enumerate(ref_valid_imgs[:args.n_log_valid_imgs])],
+                                "ref_known_valid_images": [wandb.Image(img, caption=f"{i}: {all_known_valid_captions[i]}") for i, img in enumerate(ref_known_valid_imgs[:args.n_log_valid_imgs])],
+                                "ref_unknown_valid_images": [wandb.Image(img, caption=f"{i}: {all_unknown_valid_captions[i]}") for i, img in enumerate(ref_unknown_valid_imgs[:args.n_log_valid_imgs])],
                             }, step=global_step)
 
                         # part 2: median pickscore reward
-                        logger.info('\ncomputing median pickscore from unet')
-                        unet_median_pickscore = compute_median_pickscore_reward(unet_valid_imgs)
+                        logger.info('computing known median pickscore from unet')
+                        unet_known_median_pickscore = compute_median_pickscore_reward(unet_known_valid_imgs, all_known_valid_captions, args.valid_batch_size)
+                        logger.info('computing unknown median pickscore from unet')
+                        unet_unknown_median_pickscore = compute_median_pickscore_reward(unet_unknown_valid_imgs, all_unknown_valid_captions, args.valid_batch_size)
                         with open(os.path.join(val_dir, 'unet_pickscore.txt'), 'w') as f:
-                            f.write(str(unet_median_pickscore))
-                        accelerator.log({"unet_median_pickscore": unet_median_pickscore}, step=global_step)
+                            f.write(f'known: {str(unet_known_median_pickscore)}\nunknown: {str(unet_unknown_median_pickscore)}')
+                        accelerator.log({
+                            "unet_known_median_pickscore": unet_known_median_pickscore,
+                            "unet_unknown_median_pickscore": unet_unknown_median_pickscore,
+                        }, step=global_step)
 
                         # if first time, log ref unet performance
                         if global_step == args.checkpointing_steps:
-                            logger.info('\ncomputing median pickscore from ref unet')
-                            ref_median_pickscore = compute_median_pickscore_reward(ref_valid_imgs)
+                            logger.info('computing known median pickscore from unet')
+                            ref_known_median_pickscore = compute_median_pickscore_reward(ref_known_valid_imgs, all_known_valid_captions, args.valid_batch_size)
+                            logger.info('computing unknown median pickscore from unet')
+                            ref_unknown_median_pickscore = compute_median_pickscore_reward(ref_unknown_valid_imgs, all_unknown_valid_captions, args.valid_batch_size)
                             with open(os.path.join(val_dir, 'ref_pickscore.txt'), 'w') as f:
-                                f.write(str(ref_median_pickscore))
-                            accelerator.log({"ref_median_pickscore": ref_median_pickscore}, step=global_step)
+                                f.write(f'known: {str(ref_known_median_pickscore)}\nunknown: {str(ref_unknown_median_pickscore)}')
+                            accelerator.log({
+                                "ref_known_median_pickscore": ref_known_median_pickscore,
+                                "ref_unknown_median_pickscore": ref_unknown_median_pickscore,
+                            }, step=global_step)
 
                         # part 3: estimate implicit acc with 10 random timesteps for pickapic validation set
-                        logger.info('\ncomputing unet implicit accuracy from unet')
-                        unet_implicit_acc = sum(compute_valid_implicit_acc(unet, ref_unet) for _ in range(10)) / 10
+                        logger.info('computing known implicit accuracy from unet')
+                        unet_known_implicit_acc = sum(compute_implicit_acc(unet, ref_unet, known_valid_dataloader) for _ in range(10)) / 10
+                        logger.info('computing unknown implicit accuracy from unet')
+                        unet_unknown_implicit_acc = sum(compute_implicit_acc(unet, ref_unet, unknown_valid_dataloader) for _ in range(10)) / 10
                         with open(os.path.join(val_dir, 'unet_implicit_acc.txt'), 'w') as f:
-                            f.write(str(unet_implicit_acc))
-                        accelerator.log({"unet_implicit_acc": unet_implicit_acc}, step=global_step)
+                            f.write(f'known: {str(unet_known_implicit_acc)}\nunknown: {str(unet_unknown_implicit_acc)}')
+                        accelerator.log({
+                            "unet_known_implicit_acc": unet_known_implicit_acc,
+                            "unet_unknown_implicit_acc": unet_unknown_implicit_acc,
+                        }, step=global_step)
 
                         # TODO part 4: CLIP text-to-image alignment
                         # TODO part 5: FID and stuff to see if KL-divergence is working
