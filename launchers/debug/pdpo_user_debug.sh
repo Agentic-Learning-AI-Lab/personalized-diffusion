@@ -8,8 +8,8 @@ export DATASET_NAME="yuvalkirstain/pickapic_v2"
 accelerate launch --mixed_precision="fp16" train_user.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --dataset_name=$DATASET_NAME \
-  --train_batch_size=16 \
-  --valid_batch_size=16 \
+  --train_batch_size=8 \
+  --valid_batch_size=8 \
   --max_user_proportion=0.1 \
   --max_gen=500 \
   --max_train_steps=100000 \
@@ -19,8 +19,8 @@ accelerate launch --mixed_precision="fp16" train_user.py \
   --allow_tf32 \
   --dataloader_num_worker=16 \
   --gradient_accumulation_steps 4 \
-  --num_inference_steps 1 \
-  --tag 0914_dpo_user_debug_lora \
-  --checkpointing_steps 2 \
+  --num_inference_steps 3 \
+  --tag 0917_pdpo_user_debug_lora \
+  --checkpointing_steps 4 \
   --lora_rank 4 \
-  --train_method dpo
+  --train_method pdpo

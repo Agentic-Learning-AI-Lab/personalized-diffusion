@@ -20,7 +20,7 @@ accelerate launch --mixed_precision="fp16" train_user.py \
   --dataloader_num_worker=16 \
   --gradient_accumulation_steps 4 \
   --num_inference_steps 1 \
-  --tag 0914_dpo_user_debug_lora \
+  --tag 0917_sft_user_debug_lora \
   --checkpointing_steps 2 \
   --lora_rank 4 \
-  --train_method dpo
+  --train_method sft
