@@ -5,7 +5,7 @@ export DATASET_NAME="yuvalkirstain/pickapic_v2"
 # Effective BS will be (N_GPU * train_batch_size * gradient_accumulation_steps)
 # Paper used 2048. Training takes ~24 hours / 2000 steps
 
-accelerate launch --mixed_precision="fp16" train.py \
+accelerate launch --mixed_precision="fp16" train_general.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --dataset_name=$DATASET_NAME \
   --train_batch_size=16 \
@@ -19,7 +19,7 @@ accelerate launch --mixed_precision="fp16" train.py \
   --gradient_accumulation_steps 4 \
   --max_train_samples 100000 \
   --num_inference_steps 1 \
-  --tag 0910_dpo_debug_lora \
-  --checkpointing_steps 100000 \
+  --tag 0910_dpo_debug_2gpu_lora \
+  --checkpointing_steps 10000 \
   --lora_rank 4 \
   --wandb
