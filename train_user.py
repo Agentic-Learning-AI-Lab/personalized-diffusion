@@ -1,5 +1,20 @@
 # TODO: SDXL
 # TODO: multi-GPU evaluation
+# TODO: make sure working for lora/full, sft/dpo/pdpo
+# TODO: do the mengye split
+# TODO: check released weights to see if the generated images are actually that good and if training is that fast
+# TODO: log samples should be lower resolution to make wandb faster
+# TODO: why are only 8 images logged on wandb? log many qualitative comparisons pls
+# TODO: why does implicit acc accumulated look weird https://wandb.ai/yl11330/personalized_diffusion/runs/gbv4qye8?nw=nwuseryl11330
+# TODO: make sure again that the learnable defauilt user embedding and other user embeddings are used properly
+# TODO: increase number of gen samples for more stable pickscore
+# TODO: Do the aUb^t thing where U is learned in the outer loop, a and b are for each user but U is the big matrix,
+#       if U is small just put a U and V aside (see if this actually gonna work by doing some back of envelope)
+# TODO: increase learning rate?
+# TODO: design a simple case to test sft/dpo: all users like black white,
+# TODO: design a simple case to test pdpo: some users like black white, some like very high saturation, high exposure, high contrast, film grain, blurred image
+# TODO: write an inference script that can select which user to output image, to check if user outputs are tailored to their preference
+
 
 #!/usr/bin/env python
 # coding=utf-8
@@ -49,6 +64,9 @@ from diffusers.utils import check_min_version, convert_state_dict_to_diffusers
 from utils.misc import cast_training_params, chunks, compute_loss_sft, compute_loss_dpo, count_param_in_model
 from utils.pickscore_utils import Selector as PickScoreSelector
 
+from personalized_unet import PersonalizedUNet
+
+
 import wandb
 wandb.login(key='faf21d9ff65ee150697c7e96f070616f6b662134', relogin=True)
 
@@ -66,7 +84,7 @@ def parse_args():
     # data
     parser.add_argument("--dataset_name", type=str, default='yuvalkirstain/pickapic_v2')
     parser.add_argument("--cache_dir", type=str, default=None, help="The directory where the downloaded models and datasets will be stored.")
-    parser.add_argument("--max_valid_captions", type=int, default=None, help="For debugging purposes or quicker evaluation, truncate the number of evaluation examples.")
+    parser.add_argument("--max_gen", type=int, default=None, help="For debugging purposes or quicker evaluation, truncate the number of evaluation examples.")
     parser.add_argument("--resolution", type=int, default=512, help="The resolution for input images")
     parser.add_argument("--random_crop", default=False, action="store_true", help="If set the images will be randomly cropped (instead of center), images resized before cropping")
     parser.add_argument("--no_hflip", action="store_true", help="whether to supress horizontal flipping")
@@ -93,7 +111,7 @@ def parse_args():
     parser.add_argument("--wandb", action='store_true', help="whether to log wandb")
     parser.add_argument("--tracker_project_name", type=str, default="personalized_diffusion", help="The `project_name` argument passed to tor.init_trackers")
     # DPO
-    parser.add_argument("--sft", action='store_true', help="Run Supervised Fine-Tuning instead of Direct Preference Optimization")
+    parser.add_argument("--train_method", type=str, required=True, choices=['sft', 'dpo', 'pdpo'], help="Training method")
     parser.add_argument("--beta_dpo", type=float, default=5000, help="The beta DPO temperature controlling strength of KL penalty")
     parser.add_argument("--proportion_empty_prompts", type=float, default=0.0, help="Proportion of image prompts to be replaced with empty strings. Defaults to 0 (no prompt replacement).")
     # misc
@@ -105,20 +123,21 @@ def parse_args():
     parser.add_argument("--num_inference_steps", type=int, default=50, help="Number of inference steps")
     parser.add_argument("--n_log_valid_imgs", type=int, default=10, help="Number generated images to log in evaluation")
     # user preference training
+    parser.add_argument("--user_init_std", type=float, default=0.03, help="Initialization std of the user embeddings")
     parser.add_argument("--max_user_proportion", type=float, default=1.0, help='proportion of user to keep, used to subset our dataset')
     parser.add_argument("--per_user_contribution_thr", type=int, default=200, help='users with less contribution than this threshold are put into validation')
     parser.add_argument("--per_user_n_eval", type=int, default=100, help='number of evaluation samples per user')
-
+    parser.add_argument("--alpha", type=float, default=0.5, help='balancing between user specific loss and general human feedback loss')
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
-    args.train_method = 'sft' if args.sft else 'dpo'
     args.output_dir = os.path.join(args.output_dir, args.tag)
 
     assert args.per_user_n_eval < args.per_user_contribution_thr
     assert 0.0 <= args.max_user_proportion <= 1.0
+    assert 0.0 <= args.alpha <= 1.0
     return args
 
 
@@ -183,54 +202,7 @@ def main():
             logger.info('saving unet model (no lora)')
             accelerator.save_state(save_path)
 
-    ### START DIFFUSION BOILERPLATE ###
-    # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler", torch_dtype=weight_dtype)
-    tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer", torch_dtype=weight_dtype)
-    text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder", torch_dtype=weight_dtype)
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder='vae', torch_dtype=weight_dtype)
-    # clone of model
-    ref_unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet", torch_dtype=weight_dtype)
-
-    # Freeze vae, text_encoder(s), reference unet
-    vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
-    ref_unet.requires_grad_(False)
-
-    # unet & optionally LORA
-    unet_dtype = weight_dtype if args.lora_rank > 0 else torch.float32
-    unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet", torch_dtype=unet_dtype)
-    if args.lora_rank > 0:
-        unet.requires_grad_(False)
-        unet_lora_config = LoraConfig(
-            r=args.lora_rank,
-            lora_alpha=args.lora_rank,
-            init_lora_weights="gaussian",
-            target_modules=["to_k", "to_q", "to_v", "to_out.0"],
-        )
-        unet.add_adapter(unet_lora_config)
-        if args.mixed_precision == 'fp16':
-            cast_training_params(unet, dtype=torch.float32)
-    unet.enable_xformers_memory_efficient_attention()
-    lora_layers = filter(lambda p: p.requires_grad, unet.parameters()) if args.lora_rank > 0 else None
-
-    # load PickScore as the selector model (for evaluation only for now)
-    pickscore_model = PickScoreSelector(accelerator.device)
-
-    if args.allow_tf32:
-        torch.backends.cuda.matmul.allow_tf32 = True
-
-    if args.scale_lr:
-        args.learning_rate *= args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
-
-    optimizer = torch.optim.AdamW(
-        lora_layers if args.lora_rank > 0 else unet.parameters(),
-        lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
-    )
-
+    ##### START BIG OLD DATASET BLOCK #####
     # In distributed training, the load_dataset function guarantees that only one local process can concurrently
     # download the dataset.
     dataset = load_dataset(args.dataset_name, cache_dir=args.cache_dir)
@@ -271,10 +243,8 @@ def main():
             transforms.Normalize([0.5], [0.5]),
         ]
     )
-    ##### START BIG OLD DATASET BLOCK #####
     #### START PREPROCESSING/COLLATION ####
-
-    def preprocess_data_dpo(examples, transforms):
+    def preprocess_data_w_worse_img(examples, transforms):
         all_pixel_values = []
         for col_name in ['jpg_0', 'jpg_1']:
             images = [Image.open(io.BytesIO(im_bytes)).convert("RGB") for im_bytes in examples[col_name]]
@@ -304,23 +274,15 @@ def main():
         examples["input_ids"] = tokenize_captions(examples)
         return examples
 
-    def collate_fn(examples):
-        pixel_values = torch.stack([example["pixel_values"] for example in examples])
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-        return_d =  {"pixel_values": pixel_values}
-        return_d["input_ids"] = torch.stack([example["input_ids"] for example in examples])
-        return_d["user_ids"] = torch.tensor([example['user_id'] for example in examples])
-        return return_d
-
-    if args.train_method == 'dpo':
+    if args.train_method in ['dpo', 'pdpo']:
         def preprocess_train(examples):
-            return preprocess_data_dpo(examples, train_transforms)
+            return preprocess_data_w_worse_img(examples, train_transforms)
     else:
         def preprocess_train(examples):
             return preprocess_data_sft(examples, train_transforms)
 
     def preprocess_valid(examples):
-        return preprocess_data_dpo(examples, valid_transforms)
+        return preprocess_data_w_worse_img(examples, valid_transforms)
     #### END PREPROCESSING/COLLATION ####
 
     def remove_split_label(dataset):
@@ -339,7 +301,6 @@ def main():
         no_indices = [i for i in indices if i not in set(yes_indices)]
         return [l[i] for i in yes_indices], [l[i] for i in no_indices]
 
-    ### DATASET #####
     with accelerator.main_process_first():
         dataset = datasets.concatenate_datasets([dataset['train'], dataset['validation'], dataset['test']])
         dataset = remove_split_label(dataset)
@@ -362,6 +323,7 @@ def main():
             known_val_ids += x
         # get unknown user valid
         unknown_ids = [i for i, u in enumerate(dataset['user_id']) if user_id_counts[u] < args.per_user_contribution_thr]
+        unknown_users = [u for i, u in enumerate(dataset['user_id']) if user_id_counts[u] < args.per_user_contribution_thr]
         # build dataset
         known_train_dataset = dataset.select(known_train_ids).shuffle(seed=args.seed)
         known_valid_dataset = dataset.select(known_val_ids).shuffle(seed=args.seed)
@@ -375,20 +337,47 @@ def main():
         known_valid_dataset_transformed = known_valid_dataset.with_transform(preprocess_valid)
         unknown_valid_dataset_transformed = unknown_valid_dataset.with_transform(preprocess_valid)
 
+        # for initializing model and mapping user id, 0 for default and unknown
+        num_known_users = len(known_user_to_ids)
+        user_to_count = {u: len(ids) for u, ids in known_user_to_ids.items()}
+        known_users = sorted(list(user_to_count.keys()), key=lambda u: -user_to_count[u]) # in decreasing contribution
+        user_id_to_embed_id = {u: i + 1 for i, u in enumerate(known_users)}
+        for u in set(unknown_users):
+            user_id_to_embed_id[u] = 0
+
+    # for this part, for each caption take a unique caption and user
     # get the 500 unique validation captions for evaluation
-    all_known_valid_captions = sorted(set(known_valid_dataset['caption'])) # deterministic
-    all_unknown_valid_captions = sorted(set(unknown_valid_dataset['caption'])) # deterministic
-    random.shuffle(all_known_valid_captions)
-    random.shuffle(all_unknown_valid_captions)
-    if args.max_valid_captions is not None:
-        all_known_valid_captions = all_known_valid_captions[:args.max_valid_captions]
-    if args.max_valid_captions is not None:
-        all_unknown_valid_captions = all_unknown_valid_captions[:args.max_valid_captions]
+    def get_caption_userid(dataset, max_count=None):
+        captions_to_user_ids = defaultdict(list)
+        for c, u in zip(dataset['caption'], dataset['user_id']):
+            captions_to_user_ids[c].append(user_id_to_embed_id[u])
+        for c, ids in captions_to_user_ids.items():
+            captions_to_user_ids[c] = random.choice(ids)
+        captions_n_user_ids = [(c, u) for c, u in captions_to_user_ids.items()]
+        captions_n_user_ids.sort(key=lambda x: x[0])
+        random.shuffle(captions_n_user_ids)
+        if max_count is not None:
+            captions_n_user_ids = captions_n_user_ids[:max_count]
+        return captions_n_user_ids
+
+    all_known_valid_captions_n_userid = get_caption_userid(known_valid_dataset, args.max_gen)
+    all_unknown_valid_captions_n_userid = get_caption_userid(unknown_valid_dataset, args.max_gen)
     # save validation captions
-    with open(os.path.join(args.output_dir, 'all_known_valid_captions.txt'), 'w') as f:
-        f.write('\n'.join(all_known_valid_captions))
-    with open(os.path.join(args.output_dir, 'all_unknown_valid_captions.txt'), 'w') as f:
-        f.write('\n'.join(all_unknown_valid_captions))
+    with open(os.path.join(args.output_dir, 'all_known_valid_captions_n_userid.txt'), 'w') as f:
+        for c, u in all_known_valid_captions_n_userid:
+            f.write(f'{c} {u}\n')
+    with open(os.path.join(args.output_dir, 'all_unknown_valid_captions_n_userid.txt'), 'w') as f:
+        for c, u in all_unknown_valid_captions_n_userid:
+            assert u == 0, 'unknown user should map to the default 0 user'
+            f.write(f'{c} {u}\n')
+
+    def collate_fn(examples):
+        pixel_values = torch.stack([example["pixel_values"] for example in examples])
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+        return_d =  {"pixel_values": pixel_values}
+        return_d["input_ids"] = torch.stack([example["input_ids"] for example in examples])
+        return_d["user_ids"] = torch.tensor([user_id_to_embed_id[example['user_id']] for example in examples])
+        return return_d
 
     # DataLoaders creation:
     known_train_dataloader = torch.utils.data.DataLoader(
@@ -416,6 +405,68 @@ def main():
         drop_last=False
     )
     ##### END BIG OLD DATASET BLOCK #####
+
+    ### START DIFFUSION BOILERPLATE ###
+    # Load scheduler, tokenizer and models.
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler", torch_dtype=weight_dtype)
+    tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer", torch_dtype=weight_dtype)
+    text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder", torch_dtype=weight_dtype)
+    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder='vae', torch_dtype=weight_dtype)
+    # clone of model
+    ref_unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet", torch_dtype=weight_dtype)
+
+    # Freeze vae, text_encoder(s), reference unet
+    vae.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+    ref_unet.requires_grad_(False)
+
+    # unet & optionally LORA
+    unet_dtype = weight_dtype if args.lora_rank > 0 else torch.float32
+    if args.train_method in ['sft', 'dpo']:
+        unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet", torch_dtype=unet_dtype)
+    else:
+        unet = PersonalizedUNet.from_pretrained(
+            args.pretrained_model_name_or_path,
+            num_user_embeds=num_known_users,
+            user_init_std=args.user_init_std,
+            subfolder="unet",
+            torch_dtype=unet_dtype,
+            low_cpu_mem_usage=False
+        )
+    unet.requires_grad_(True)
+
+    if args.lora_rank > 0:
+        unet.requires_grad_(False)
+        unet_lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_rank,
+            init_lora_weights="gaussian",
+            target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        )
+        unet.add_adapter(unet_lora_config) # somehow turns all grad off in unet
+        if args.train_method == 'pdpo':
+            unet.user_embeddings.requires_grad_(True)
+        if args.mixed_precision == 'fp16':
+            cast_training_params(unet, dtype=torch.float32)
+    unet.enable_xformers_memory_efficient_attention()
+    lora_layers = filter(lambda p: p.requires_grad, unet.parameters()) if args.lora_rank > 0 else None
+
+    # load PickScore as the selector model (for evaluation only for now)
+    pickscore_model = PickScoreSelector(accelerator.device)
+
+    if args.allow_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+    if args.scale_lr:
+        args.learning_rate *= args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+
+    optimizer = torch.optim.AdamW(
+        lora_layers if args.lora_rank > 0 else unet.parameters(),
+        lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
+    )
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
@@ -453,7 +504,7 @@ def main():
 
     # validation utils
     @torch.no_grad()
-    def generate_images(unet, captions, batch_size):
+    def generate_images(unet, captions_n_userid, batch_size):
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
         diffusers.utils.logging.set_verbosity_error()
         pipeline = StableDiffusionPipeline.from_pretrained(
@@ -468,9 +519,14 @@ def main():
 
         imgs = []
         with torch.autocast("cuda"):
-            n_batches = math.ceil(len(captions) / batch_size)
-            for caps in tqdm(chunks(captions, batch_size), total=n_batches):
-                imgs = pipeline(caps, num_inference_steps=args.num_inference_steps, generator=generator).images
+            n_batches = math.ceil(len(captions_n_userid) / batch_size)
+            for chunk in tqdm(chunks(captions_n_userid, batch_size), total=n_batches):
+                caps, uids = [x[0] for x in chunk], [x[1] for x in chunk]
+                cross_attention_kwargs = None
+                if args.train_method == 'pdpo':
+                    uids = torch.tensor(uids, dtype=torch.int64, device=accelerator.device).repeat(2)
+                    cross_attention_kwargs = {'user_ids': uids}
+                imgs = pipeline(caps, cross_attention_kwargs=cross_attention_kwargs, num_inference_steps=args.num_inference_steps, generator=generator).images
         diffusers.utils.logging.set_verbosity_warning()
         del pipeline
         return imgs
@@ -488,6 +544,7 @@ def main():
 
     @torch.no_grad()
     def compute_implicit_acc(unet, ref_unet, dataloader):
+        diffusers.utils.logging.set_verbosity_error()
         avg_implicit_acc = 0
         for batch in tqdm(dataloader, total=len(dataloader)):
             feed_pixel_values = torch.cat(batch["pixel_values"].chunk(2, dim=1))
@@ -497,11 +554,16 @@ def main():
             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=latents.device)\
                 .long().chunk(2)[0].repeat(2)
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-            assert noise_scheduler.config.prediction_type == "epsilon"
-            target = noise
-            model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-            _, _, _, implicit_acc = compute_loss_dpo(args, model_pred, target, ref_unet, encoder_hidden_states, noisy_latents, timesteps)
+            # model prediction with or without user
+            cross_attention_kwargs = None
+            if args.train_method == 'pdpo':
+                uids = batch['user_ids'].repeat(2)
+                cross_attention_kwargs = {'user_ids': uids}
+            model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, cross_attention_kwargs=cross_attention_kwargs).sample
+            # compute acc
+            _, _, _, implicit_acc = compute_loss_dpo(args, model_pred, noise, ref_unet, encoder_hidden_states, noisy_latents, timesteps)
             avg_implicit_acc += implicit_acc * batch["input_ids"].shape[0]
+        diffusers.utils.logging.set_verbosity_warning()
         return avg_implicit_acc / len(dataloader.dataset)
 
     # Training initialization
@@ -523,15 +585,18 @@ def main():
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
 
+    # diffusers.utils.logging.set_verbosity_error() # xformer complains about cross attention kwargs
+
     #### START MAIN TRAINING LOOP #####
     for epoch in range(args.num_train_epochs):
         unet.train()
         train_loss = 0.0
-        implicit_acc_accumulated = 0.0
+        implicit_acc_accumulated, known_implicit_acc_accumulated, unknown_implicit_acc_accumulated = 0.0, 0.0, 0.0
+
         for step, batch in enumerate(known_train_dataloader):
             with accelerator.accumulate(unet):
                 # Convert images to latent space
-                if args.train_method == 'dpo':
+                if args.train_method in ['dpo', 'pdpo']:
                     # y_w and y_l were concatenated along channel dimension
                     feed_pixel_values = torch.cat(batch["pixel_values"].chunk(2, dim=1))
                     # If using AIF then we haven't ranked yet so do so now
@@ -552,7 +617,7 @@ def main():
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
                 timesteps = timesteps.long()
 
-                if args.train_method == 'dpo': # make timesteps and noise same for pairs in DPO
+                if args.train_method in ['dpo', 'pdpo']: # make timesteps and noise same for pairs in DPO
                     timesteps = timesteps.chunk(2)[0].repeat(2)
                     noise = noise.chunk(2)[0].repeat(2, 1, 1, 1)
 
@@ -564,35 +629,47 @@ def main():
                 # Get the text embedding for conditioning
                 with torch.no_grad():
                     encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-                if args.train_method == 'dpo':
+                if args.train_method in ['dpo', 'pdpo']:
                     encoder_hidden_states = encoder_hidden_states.repeat(2, 1, 1)
                 #### END PREP BATCH ####
 
-                assert noise_scheduler.config.prediction_type == "epsilon"
-                target = noise
-
-                # Make the prediction from the model we're learning
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-                #### START LOSS COMPUTATION ####
                 if args.train_method == 'sft': # SFT, casting for F.mse_loss
-                    loss = compute_loss_sft(model_pred, target)
-                elif args.train_method == 'dpo':
-                    loss, raw_model_loss, raw_ref_loss, implicit_acc = compute_loss_dpo(
-                        args, model_pred, target, ref_unet, encoder_hidden_states, noisy_latents, timesteps
-                    )
-                #### END LOSS COMPUTATION ###
+                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                    loss = compute_loss_sft(model_pred, noise)
+                    # Gather the losses across all processes for logging
+                    avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+                    train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
-                # Gather the losses across all processes for logging
-                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
-                train_loss += avg_loss.item() / args.gradient_accumulation_steps
-                # Also gather:
-                # - model MSE vs reference MSE (useful to observe divergent behavior)
-                # - Implicit accuracy
-                if args.train_method == 'dpo':
+                elif args.train_method == 'dpo':
+                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                    loss, raw_model_loss, raw_ref_loss, implicit_acc = compute_loss_dpo(args, model_pred, noise, ref_unet, encoder_hidden_states, noisy_latents, timesteps)
+                    # gather:
                     avg_model_mse = accelerator.gather(raw_model_loss.repeat(args.train_batch_size)).mean().item()
                     avg_ref_mse = accelerator.gather(raw_ref_loss.repeat(args.train_batch_size)).mean().item()
                     avg_acc = accelerator.gather(implicit_acc).mean().item()
                     implicit_acc_accumulated += avg_acc / args.gradient_accumulation_steps
+
+                else:
+                    known_user_ids = batch['user_ids'].repeat(2)
+                    unknown_user_ids = torch.zeros_like(known_user_ids, dtype=known_user_ids.dtype, device=known_user_ids.device)
+                    known_model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, cross_attention_kwargs={'user_ids': known_user_ids}).sample
+                    unknown_model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, cross_attention_kwargs={'user_ids': unknown_user_ids}).sample
+                    known_loss, known_raw_model_loss, known_raw_ref_loss, known_implicit_acc = compute_loss_dpo(
+                        args, known_model_pred, noise, ref_unet, encoder_hidden_states, noisy_latents, timesteps
+                    )
+                    unknown_loss, unknown_raw_model_loss, unknown_raw_ref_loss, unknown_implicit_acc = compute_loss_dpo(
+                        args, unknown_model_pred, noise, ref_unet, encoder_hidden_states, noisy_latents, timesteps
+                    )
+                    loss = known_loss * args.alpha + unknown_loss * (1.0 - args.alpha)
+                    # gather:
+                    avg_known_model_mse = accelerator.gather(known_raw_model_loss.repeat(args.train_batch_size)).mean().item()
+                    avg_known_ref_mse = accelerator.gather(known_raw_ref_loss.repeat(args.train_batch_size)).mean().item()
+                    avg_known_acc = accelerator.gather(known_implicit_acc).mean().item()
+                    known_implicit_acc_accumulated += avg_known_acc / args.gradient_accumulation_steps
+                    avg_unknown_model_mse = accelerator.gather(unknown_raw_model_loss.repeat(args.train_batch_size)).mean().item()
+                    avg_unknown_ref_mse = accelerator.gather(unknown_raw_ref_loss.repeat(args.train_batch_size)).mean().item()
+                    avg_unknown_acc = accelerator.gather(unknown_implicit_acc).mean().item()
+                    unknown_implicit_acc_accumulated += avg_unknown_acc / args.gradient_accumulation_steps
 
                 # Backpropagate
                 accelerator.backward(loss)
@@ -609,11 +686,22 @@ def main():
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
-                accelerator.log({"train_loss": train_loss}, step=global_step)
-                if args.train_method == 'dpo':
+
+                # some wandb logging
+                if args.train_method == 'sft':
+                    accelerator.log({"train_loss": train_loss}, step=global_step)
+                elif args.train_method == 'dpo':
                     accelerator.log({"model_mse_unaccumulated": avg_model_mse}, step=global_step)
                     accelerator.log({"ref_mse_unaccumulated": avg_ref_mse}, step=global_step)
                     accelerator.log({"implicit_acc_accumulated": implicit_acc_accumulated}, step=global_step)
+                else:
+                    accelerator.log({"known_model_mse_unaccumulated": avg_known_model_mse}, step=global_step)
+                    accelerator.log({"known_ref_mse_unaccumulated": avg_known_ref_mse}, step=global_step)
+                    accelerator.log({"known_implicit_acc_accumulated": known_implicit_acc_accumulated}, step=global_step)
+                    accelerator.log({"unknown_model_mse_unaccumulated": avg_unknown_model_mse}, step=global_step)
+                    accelerator.log({"unknown_ref_mse_unaccumulated": avg_unknown_ref_mse}, step=global_step)
+                    accelerator.log({"unknown_implicit_acc_accumulated": unknown_implicit_acc_accumulated}, step=global_step)
+
                 train_loss = 0.0
                 implicit_acc_accumulated = 0.0
 
@@ -631,30 +719,32 @@ def main():
                         # validation
                         # part 1: generate some images from unet and ref unet, upload few to wandb
                         logger.info('generating known valid images from unet')
-                        unet_known_valid_imgs = generate_images(unet, all_known_valid_captions, args.valid_batch_size)
+                        unet_known_valid_imgs = generate_images(unet, all_known_valid_captions_n_userid, args.valid_batch_size)
                         logger.info('generating unknown valid images from unet')
-                        unet_unknown_valid_imgs = generate_images(unet, all_unknown_valid_captions, args.valid_batch_size)
+                        unet_unknown_valid_imgs = generate_images(unet, all_unknown_valid_captions_n_userid, args.valid_batch_size)
                         for i, img in enumerate(unet_known_valid_imgs): img.save(os.path.join(val_dir, f'unet_known_{i}.jpg'))
                         for i, img in enumerate(unet_unknown_valid_imgs): img.save(os.path.join(val_dir, f'unet_unknown_{i}.jpg'))
                         accelerator.log({
-                            "unet_known_valid_images": [wandb.Image(img, caption=f"{i}: {all_known_valid_captions[i]}") for i, img in enumerate(unet_known_valid_imgs[:args.n_log_valid_imgs])],
-                            "unet_unknown_valid_images": [wandb.Image(img, caption=f"{i}: {all_unknown_valid_captions[i]}") for i, img in enumerate(unet_unknown_valid_imgs[:args.n_log_valid_imgs])],
+                            "unet_known_valid_images": [wandb.Image(img, caption=f"{i}: {all_known_valid_captions_n_userid[i][0]}") for i, img in enumerate(unet_known_valid_imgs[:args.n_log_valid_imgs])],
+                            "unet_unknown_valid_images": [wandb.Image(img, caption=f"{i}: {all_unknown_valid_captions_n_userid[i][0]}") for i, img in enumerate(unet_unknown_valid_imgs[:args.n_log_valid_imgs])],
                         }, step=global_step)
 
                         # if first time, log ref unet performance
                         if global_step == args.checkpointing_steps:
                             logger.info('generating known valid images from ref')
-                            ref_known_valid_imgs = generate_images(ref_unet, all_known_valid_captions, args.valid_batch_size)
+                            ref_known_valid_imgs = generate_images(ref_unet, all_known_valid_captions_n_userid, args.valid_batch_size)
                             logger.info('generating unknown valid images from ref')
-                            ref_unknown_valid_imgs = generate_images(ref_unet, all_unknown_valid_captions, args.valid_batch_size)
+                            ref_unknown_valid_imgs = generate_images(ref_unet, all_unknown_valid_captions_n_userid, args.valid_batch_size)
                             for i, img in enumerate(ref_known_valid_imgs): img.save(os.path.join(val_dir, f'ref_known_{i}.jpg'))
                             for i, img in enumerate(ref_unknown_valid_imgs): img.save(os.path.join(val_dir, f'ref_unknown_{i}.jpg'))
                             accelerator.log({
-                                "ref_known_valid_images": [wandb.Image(img, caption=f"{i}: {all_known_valid_captions[i]}") for i, img in enumerate(ref_known_valid_imgs[:args.n_log_valid_imgs])],
-                                "ref_unknown_valid_images": [wandb.Image(img, caption=f"{i}: {all_unknown_valid_captions[i]}") for i, img in enumerate(ref_unknown_valid_imgs[:args.n_log_valid_imgs])],
+                                "ref_known_valid_images": [wandb.Image(img, caption=f"{i}: {all_known_valid_captions_n_userid[i][0]}") for i, img in enumerate(ref_known_valid_imgs[:args.n_log_valid_imgs])],
+                                "ref_unknown_valid_images": [wandb.Image(img, caption=f"{i}: {all_unknown_valid_captions_n_userid[i][0]}") for i, img in enumerate(ref_unknown_valid_imgs[:args.n_log_valid_imgs])],
                             }, step=global_step)
 
                         # part 2: median pickscore reward
+                        all_known_valid_captions = [x[0] for x in all_known_valid_captions_n_userid]
+                        all_unknown_valid_captions = [x[0] for x in all_unknown_valid_captions_n_userid]
                         logger.info('computing known median pickscore from unet')
                         unet_known_median_pickscore = compute_median_pickscore_reward(unet_known_valid_imgs, all_known_valid_captions, args.valid_batch_size)
                         logger.info('computing unknown median pickscore from unet')
@@ -681,9 +771,9 @@ def main():
 
                         # part 3: estimate implicit acc with 10 random timesteps for pickapic validation set
                         logger.info('computing known implicit accuracy from unet')
-                        unet_known_implicit_acc = sum(compute_implicit_acc(unet, ref_unet, known_valid_dataloader) for _ in range(10)) / 10
+                        unet_known_implicit_acc = compute_implicit_acc(unet, ref_unet, known_valid_dataloader)
                         logger.info('computing unknown implicit accuracy from unet')
-                        unet_unknown_implicit_acc = sum(compute_implicit_acc(unet, ref_unet, unknown_valid_dataloader) for _ in range(10)) / 10
+                        unet_unknown_implicit_acc = compute_implicit_acc(unet, ref_unet, unknown_valid_dataloader)
                         with open(os.path.join(val_dir, 'unet_implicit_acc.txt'), 'w') as f:
                             f.write(f'known: {str(unet_known_implicit_acc)}\nunknown: {str(unet_unknown_implicit_acc)}')
                         accelerator.log({
@@ -697,6 +787,9 @@ def main():
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             if args.train_method == 'dpo':
                 logs["implicit_acc"] = avg_acc
+            elif args.train_method == 'pdpo':
+                logs["known_implicit_acc"] = avg_known_acc
+                logs["unknown_implicit_acc"] = avg_unknown_acc
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
