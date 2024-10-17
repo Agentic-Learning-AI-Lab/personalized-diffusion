@@ -1,8 +1,10 @@
 # TODO: SDXL
 # TODO: multi-GPU evaluation
-# TODO: make sure working for lora/full, sft/dpo/pdpo
+# TODO: make make_sbatch.py work
+# TODO: speed up dataset subset in train_user.py, cache stuff, diagnose why theres another slow period after it
+# TODO: check released weights to see if the generated images are actually that good
+# TODO: use the released script to see how fast training actually is
 # TODO: do the mengye split
-# TODO: check released weights to see if the generated images are actually that good and if training is that fast
 # TODO: log samples should be lower resolution to make wandb faster
 # TODO: why are only 8 images logged on wandb? log many qualitative comparisons pls
 # TODO: why does implicit acc accumulated look weird https://wandb.ai/yl11330/personalized_diffusion/runs/gbv4qye8?nw=nwuseryl11330
@@ -14,6 +16,7 @@
 # TODO: design a simple case to test sft/dpo: all users like black white,
 # TODO: design a simple case to test pdpo: some users like black white, some like very high saturation, high exposure, high contrast, film grain, blurred image
 # TODO: write an inference script that can select which user to output image, to check if user outputs are tailored to their preference
+# TODO: adapt mengyes metalearning idea on prompt embeddings
 
 
 #!/usr/bin/env python
@@ -79,11 +82,11 @@ os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     # model
-    parser.add_argument("--pretrained_model_name_or_path", type=str, default=None, required=True, help="Path to pretrained model or model identifier from huggingface.co/models.")
+    parser.add_argument("--pretrained_model_name_or_path", type=str, default="pt-sk/stable-diffusion-1.5", help="Path to pretrained model or model identifier from huggingface.co/models.")
     parser.add_argument("--lora_rank", type=int, default=-1, help="The dimension of the LoRA update matrices.")
     # data
-    parser.add_argument("--dataset_name", type=str, default='yuvalkirstain/pickapic_v2')
-    parser.add_argument("--cache_dir", type=str, default=None, help="The directory where the downloaded models and datasets will be stored.")
+    parser.add_argument("--dataset_name", type=str, default='yuvalkirstain/pickapic_v2', help='name of dataset')
+    parser.add_argument("--cache_dir", type=str, default='./pick_a_pic_v2/', help="The directory where the downloaded models and datasets will be stored.")
     parser.add_argument("--max_gen", type=int, default=None, help="For debugging purposes or quicker evaluation, truncate the number of evaluation examples.")
     parser.add_argument("--resolution", type=int, default=512, help="The resolution for input images")
     parser.add_argument("--random_crop", default=False, action="store_true", help="If set the images will be randomly cropped (instead of center), images resized before cropping")
